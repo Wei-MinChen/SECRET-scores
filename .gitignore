@@ -1,0 +1,6 @@
+secretscores
+*.o
+example/out*
+example/ex.*
+example/model.txt
+example/*.bin
