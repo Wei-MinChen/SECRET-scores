@@ -866,9 +866,12 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
    if(single) missSNP.assign(idCount, 0.0);
    int batchStart = 0, batchNumber = 0;
    while(batchStart < modelCount){
-      // models are added to the batch while the union of their SNPs fits in memory and has fewer
-      // than MAX_TOUCHED_SNPS_PER_BATCH SNPs, and the batch has fewer than maxBatchModels models
-      // (idCount people x ceil(SNPs/4) bytes)
+      // Models are added to the batch until it has maxBatchModels models, or has at least
+      // minModels models and the union of their SNPs ("touched") has reached
+      // TARGET_TOUCHED_SNPS_PER_BATCH SNPs (the model that reaches it is kept).  The memory limit
+      // comes first: a model that would make the genotypes (idCount people x ceil(SNPs/4) bytes)
+      // exceed GENOTYPE_MEMORY_LIMIT is left for the next batch, even below minModels.
+      const int minModels = std::min(MIN_MODELS_PER_BATCH, maxBatchModels);
       std::vector<int> touched;
       int batchEnd = batchStart;
       while(batchEnd < modelCount && batchEnd - batchStart < maxBatchModels){
@@ -880,14 +883,15 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
                touched.push_back(rows[m]);
             }
          if(batchEnd > batchStart &&
-            ((long long)((touched.size() + 3) / 4) * idCount > GENOTYPE_MEMORY_LIMIT ||
-             touched.size() >= (size_t) MAX_TOUCHED_SNPS_PER_BATCH)){
+            (long long)((touched.size() + 3) / 4) * idCount > GENOTYPE_MEMORY_LIMIT){
             for(size_t t = before; t < touched.size(); t++)
                needed[touched[t]] = 0;
             touched.resize(before);
             break;
          }
          batchEnd++;
+         if(batchEnd - batchStart >= minModels && touched.size() >= (size_t) TARGET_TOUCHED_SNPS_PER_BATCH)
+            break;
       }
       if((long long)((touched.size() + 3) / 4) * idCount > GENOTYPE_MEMORY_LIMIT){
          String need = MemoryInfo((double)((touched.size() + 3) / 4) * idCount);
