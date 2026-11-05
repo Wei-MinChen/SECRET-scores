@@ -37,14 +37,17 @@
   #define FTELL64 ftello
 #endif
 
-// The limits of a batch of models, besides the memory (GENOTYPE_MEMORY_LIMIT): a batch loads the
-// union of the SNPs of its models, so thousands of models in one batch make the loaded set huge
-// and the scoring of each person slow.  A batch has at most MAX_MODELS_PER_BATCH models and
-// fewer than MAX_TOUCHED_SNPS_PER_BATCH different SNPs (a single model is never split, so it may
-// have more); the actual number of models of a batch can be much smaller than the first.
-// --batchmodels (debug build) changes the first.
+// How many models go into a batch, besides the memory limit (GENOTYPE_MEMORY_LIMIT): a batch loads
+// the union of the SNPs of its models ("touched" SNPs), so the .bed file is read once per batch,
+// but thousands of models in one batch make the loaded set huge and the scoring of each person
+// slow.  Models are added to a batch until it has MAX_MODELS_PER_BATCH models, or it has at least
+// MIN_MODELS_PER_BATCH models and the touched SNPs have reached TARGET_TOUCHED_SNPS_PER_BATCH (the
+// model that reaches the target is kept in the batch).  The memory limit comes first: a model that
+// would exceed it goes to the next batch, even if the batch then has fewer than the minimum.
+// --batchmodels (debug build) changes the maximum (and the minimum, if it is lower).
+#define MIN_MODELS_PER_BATCH 100
 #define MAX_MODELS_PER_BATCH 1000
-#define MAX_TOUCHED_SNPS_PER_BATCH 9000000
+#define TARGET_TOUCHED_SNPS_PER_BATCH 9000000
 
 // chromosome codes of the PLINK .bim file (human): 1-22 autosomes,
 // 23 = X, 24 = Y, 25 = XY (pseudo-autosomal), 26 = MT
