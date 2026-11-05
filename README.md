@@ -138,6 +138,6 @@ names must be unique.
 - **Speed:** individual-major `.bed` files are faster than the default SNP-major ones. Convert once with
   `plink2 --bfile ex --export ind-major-bed --out ex_indmajor` and use `-b ex_indmajor`.
 - **Memory:** about half of the available RAM is used to hold genotypes; many models are
-  scored in batches of at most 1000 models and fewer than 5 million different SNPs.
+  scored in batches of at most 1000 models and fewer than 9 million different SNPs.
 - **Check coverage:** look at `*_scores.coverage` before trusting a score. Low coverage
   usually means a genome-build mismatch between the model and your data.
