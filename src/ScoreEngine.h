@@ -44,7 +44,7 @@
 // have more); the actual number of models of a batch can be much smaller than the first.
 // --batchmodels (debug build) changes the first.
 #define MAX_MODELS_PER_BATCH 1000
-#define MAX_TOUCHED_SNPS_PER_BATCH 5000000
+#define MAX_TOUCHED_SNPS_PER_BATCH 9000000
 
 // chromosome codes of the PLINK .bim file (human): 1-22 autosomes,
 // 23 = X, 24 = Y, 25 = XY (pseudo-autosomal), 26 = MT
