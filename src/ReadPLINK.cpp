@@ -85,10 +85,20 @@ void ScoreEngine::ReadPLINKBinary(FILE *fp, std::vector<int> & rows)
       ReadPLINKBinarySNPMajor(fp, rows);
 }
 
-// Individual-major file -> individual-major storage.  The file is read once, person by person
-// (large sequential reads); the SNPs of `rows` are picked out of each person's genotypes
-// and repacked, 4 per byte.  Bits that are not SNPs of `rows` (the unused bits at the
-// end of a person's bytes) are never looked at.
+// Individual-major file -> individual-major storage.  The file is read once, in large sequential
+// blocks of whole persons (readBlockBytes, 256 MB unless --blocksize says otherwise); the SNPs of
+// `rows` are picked out of each person's genotypes and repacked, 4 per byte.  Bits that are not
+// SNPs of `rows` (the unused bits at the end of a person's bytes) are never looked at.
+//
+// With a whole-genome .bim a person is tens of MB (100 M SNPs: 25 MB), so a block holds only a
+// few persons, or one.  Two things keep all the threads busy and the disk busy:
+//  - the work is split into tasks of (person, SNP_CHUNK = 65536 SNPs), not into persons, so a block of two
+//    persons still gives every thread something to do;
+//  - two blocks are held: while the other threads unpack block b, thread 0 reads block b+1, and
+//    joins in when its read is done.  The reading is serial (one stream of the file), the
+//    unpacking is in parallel.
+// Every task writes whole bytes of one person's storage that no other task writes (SNP_CHUNK is a
+// multiple of 4), so the threads need no synchronization within a block.
 void ScoreEngine::ReadPLINKBinaryIndividualMajor(FILE *fp, std::vector<int> & rows)
 {
    const int S = (int) rows.size();
@@ -99,32 +109,107 @@ void ScoreEngine::ReadPLINKBinaryIndividualMajor(FILE *fp, std::vector<int> & ro
       G_IND[i] = new unsigned char[genoBytes > 0? genoBytes: 1];
       memset(G_IND[i], 0, genoBytes > 0? genoBytes: 1);
    }
-   const long long fileBytes = (bimCount + 3) / 4;      // bytes of one person in the file
-   long long blockPersons = (64LL * 1024 * 1024) / fileBytes;   // ~64 MB at a time
+   if(S == 0 || idCount == 0) return;                   // nothing to pick out of the file
+
+   const long long fileBytes = ((long long) bimCount + 3) / 4;      // bytes of one person in the file
+   const long long blockBytes = readBlockMB > 0? (long long) readBlockMB << 20: readBlockBytes;
+   long long blockPersons = blockBytes / fileBytes;
    if(blockPersons < 1) blockPersons = 1;
    if(blockPersons > idCount) blockPersons = idCount;
-   unsigned char *buf = new unsigned char[(size_t)(blockPersons * fileBytes)];
-   const int *r = &rows[0];
-   FSEEK64(fp, 3, SEEK_SET);
-   for(int first = 0; first < idCount; first += (int) blockPersons){
-      int n = (int) blockPersons;
-      if(first + n > idCount) n = idCount - first;
-      if(fread(buf, sizeof(unsigned char), (size_t)(n * fileBytes), fp) < (size_t)(n * fileBytes))
-         error("Not enough genotypes for the sample %s", IID[first].c_str());
-#ifdef _OPENMP
-      #pragma omp parallel for num_threads(threadCount) schedule(static) if(threadCount > 1 && n > 1)
+   const int blocks = (int) ((idCount + blockPersons - 1) / blockPersons);
+#ifndef SNP_CHUNK_SIZE
+   #define SNP_CHUNK_SIZE (1 << 16)                     // SNPs per task, a multiple of 4
 #endif
-      for(int p = 0; p < n; p++){
-         const unsigned char *person = buf + (long long) p * fileBytes;
-         unsigned char *out = G_IND[first + p];
-         for(int k = 0; k < S; k++){
-            int row = r[k];
-            int code = (person[row >> 2] >> ((row & 3) * 2)) & 3;
-            out[k >> 2] |= (unsigned char)(code << ((k & 3) * 2));
+   const int SNP_CHUNK = SNP_CHUNK_SIZE;
+   const int chunks = (S + SNP_CHUNK - 1) / SNP_CHUNK;
+
+   if(blocks > 1){
+      char size[64];
+      snprintf(size, sizeof(size), "%.0f MB", (double) blockPersons * fileBytes / (1024.0 * 1024.0));
+      printf("  Reading the .bed file in %d blocks of %lld persons (%s each)\n", blocks, blockPersons, size);
+      fflush(stdout);
+   }
+   unsigned char *buf[2] = {NULL, NULL};
+   buf[0] = new unsigned char[(size_t)(blockPersons * fileBytes)];
+   if(blocks > 1) buf[1] = new unsigned char[(size_t)(blockPersons * fileBytes)];
+   const int *r = &rows[0];
+
+   FSEEK64(fp, 3, SEEK_SET);
+   // read block b into buf[b & 1]; false when the file is too short (returns the first person it lacks)
+   int shortAt = -1;
+   #define READ_BLOCK(b) \
+      do{ \
+         const int f0 = (int) ((b) * blockPersons); \
+         const int np = (int) ((idCount - f0 < blockPersons)? idCount - f0: blockPersons); \
+         const size_t want = (size_t)(np * fileBytes); \
+         const size_t got = fread(buf[(b) & 1], sizeof(unsigned char), want, fp); \
+         if(got < want) shortAt = f0 + (int)(got / fileBytes); \
+      }while(0)
+
+   READ_BLOCK(0);
+   if(shortAt < 0){
+      int nextTask = 0;                                 // the next task of the block being unpacked
+#ifdef _OPENMP
+      #pragma omp parallel num_threads(threadCount) if(threadCount > 1)
+#endif
+      {
+         int tid = 0;
+#ifdef _OPENMP
+         tid = omp_get_thread_num();
+#endif
+         for(int b = 0; b < blocks; b++){
+            const unsigned char *cur = buf[b & 1];
+            const int first = (int) (b * blockPersons);
+            const int n = (int) ((idCount - first < blockPersons)? idCount - first: blockPersons);
+            const int tasks = n * chunks;
+            if(tid == 0 && b + 1 < blocks) READ_BLOCK(b + 1);   // the next block, while the others unpack this one
+            for(;;){
+               int t;
+#ifdef _OPENMP
+               #pragma omp atomic capture
+#endif
+               t = nextTask++;
+               if(t >= tasks) break;
+               const int p = t / chunks;
+               const int k0 = (t % chunks) * SNP_CHUNK;
+               const int k1 = (k0 + SNP_CHUNK < S)? k0 + SNP_CHUNK: S;
+               const unsigned char *person = cur + (long long) p * fileBytes;
+               unsigned char *out = G_IND[first + p];
+               int k = k0;
+               for(; k + 4 <= k1; k += 4){
+                  const int r0 = r[k], r1 = r[k+1], r2 = r[k+2], r3 = r[k+3];
+                  out[k >> 2] = (unsigned char)(
+                     ((person[r0 >> 2] >> ((r0 & 3) * 2)) & 3) |
+                     (((person[r1 >> 2] >> ((r1 & 3) * 2)) & 3) << 2) |
+                     (((person[r2 >> 2] >> ((r2 & 3) * 2)) & 3) << 4) |
+                     (((person[r3 >> 2] >> ((r3 & 3) * 2)) & 3) << 6));
+               }
+               if(k < k1){                               // the last 1-3 SNPs, in one more byte
+                  unsigned char v = 0;
+                  for(int j = 0; k + j < k1; j++){
+                     const int row = r[k + j];
+                     v |= (unsigned char)(((person[row >> 2] >> ((row & 3) * 2)) & 3) << (2 * j));
+                  }
+                  out[k >> 2] = v;
+               }
+            }
+            // everybody is done with block b, and block b+1 is in memory
+#ifdef _OPENMP
+            #pragma omp barrier
+#endif
+            if(tid == 0) nextTask = 0;
+#ifdef _OPENMP
+            #pragma omp barrier
+#endif
+            if(shortAt >= 0) break;                      // the file is too short: the same for every thread
          }
       }
    }
-   delete []buf;
+   #undef READ_BLOCK
+   delete []buf[0];
+   delete []buf[1];
+   if(shortAt >= 0)
+      error("Not enough genotypes for the sample %s", IID[shortAt < idCount? shortAt: idCount - 1].c_str());
 }
 
 // SNP-major file -> individual-major storage (a transposition).  The SNPs of `rows` are read in
