@@ -66,6 +66,8 @@ needed). Use a `.bin` file with `--readmodel` exactly like a text model. Only
 single-letter A/C/G/T alleles can be stored. If the text model has the column
 `allelefrequency_effect`, the `.bin` file (version 4) stores the frequency of the effect allele of
 each SNP as a 4-byte float, right after the weights; otherwise a version 3 file is written.
+A text model with no valid SNP (for example, one whose `other_allele` column is empty throughout)
+gets no `.bin` file; it is skipped with a note and listed in `<prefix>_scores.skipped`.
 `--viewbin` prints a `.bin` model as text.
 
 ```bash
@@ -138,6 +140,6 @@ names must be unique.
 - **Speed:** individual-major `.bed` files are faster than the default SNP-major ones. Convert once with
   `plink2 --bfile ex --export ind-major-bed --out ex_indmajor` and use `-b ex_indmajor`.
 - **Memory:** about half of the available RAM is used to hold genotypes; many models are
-  scored in batches of at most 1000 models and fewer than 9 million different SNPs.
+  scored in batches of 100 to 1000 models (a batch stops once its models touch 9 million different SNPs).
 - **Check coverage:** look at `*_scores.coverage` before trusting a score. Low coverage
   usually means a genome-build mismatch between the model and your data.

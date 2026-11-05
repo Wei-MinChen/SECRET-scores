@@ -55,6 +55,8 @@
 //
 //   --makebin writes version 4 when the text model has an allelefrequency_effect column, else
 //   version 3.  The frequencies are used for mean imputation of missing genotypes (see below).
+//   A text model with no SNP that can be written (for example, every line lacks the other
+//   allele) gets no .bin file: it is skipped with a note and listed in <prefix>_scores.skipped.
 //
 //   Version 2 (secretscores 1.0.0 and 1.0.1) is the same without the headerSize field:
 //   byte 0 version = 2, bytes 1..104 the 26 SNP counts, the data from byte 105, and the
@@ -391,6 +393,19 @@ static void MakeOneBinaryModel(const std::string & textFile, const std::string &
    const unsigned int headerSize = (unsigned int) FIXED_HEADER_SIZE + (haveTrait? 8 + traitLen: 0);
    const int version = hasFreq? BIN_VERSION: BIN_VERSION_NOFREQ;
 
+   std::string notWritten;
+   char part[160];
+   if(stats.noCoord){snprintf(part, sizeof(part), "%s%d without hm_chr/hm_pos", notWritten.empty()? "": ", ", stats.noCoord); notWritten += part;}
+   if(stats.noOtherAllele){snprintf(part, sizeof(part), "%s%d without other allele", notWritten.empty()? "": ", ", stats.noOtherAllele); notWritten += part;}
+   if(stats.sameAllele){snprintf(part, sizeof(part), "%s%d with other allele = effect allele", notWritten.empty()? "": ", ", stats.sameAllele); notWritten += part;}
+   if(unsupportedAlleles){snprintf(part, sizeof(part), "%s%d with alleles other than single A/C/G/T", notWritten.empty()? "": ", ", unsupportedAlleles); notWritten += part;}
+   if(positionTooLarge){snprintf(part, sizeof(part), "%s%d with position above %ld", notWritten.empty()? "": ", ", positionTooLarge, MAX_BIN_POSITION); notWritten += part;}
+   if(stats.malformed){snprintf(part, sizeof(part), "%s%d lines without effect_allele/effect_weight", notWritten.empty()? "": ", ", stats.malformed); notWritten += part;}
+   // no SNP to write (for example, every line lacks the other allele): no .bin file is made
+   if(written == 0)
+      ThrowModelError("%s has no valid SNPs, so no binary model is written (%s)", textFile.c_str(),
+         notWritten.empty()? "the model has no SNPs": notWritten.c_str());
+
    FILE *fp = fopen(outFile.c_str(), "wb");
    if(fp == NULL) ThrowModelError("Cannot open %s to write", outFile.c_str());
    fputc(version, fp);
@@ -432,17 +447,8 @@ static void MakeOneBinaryModel(const std::string & textFile, const std::string &
    if(hasFreq) Appendf(out, " (with allele frequencies: %lld of %lld SNPs have one)", withFreq, written);
    if(!trait.empty()) Appendf(out, " (trait: %s%s%s)", trait.c_str(), efo.empty()? "": ", ", efo.c_str());
    else if(!efo.empty()) Appendf(out, " (trait_efo: %s)", efo.c_str());
-   std::string notWritten;
-   char part[160];
-   if(stats.noCoord){snprintf(part, sizeof(part), "%s%d without hm_chr/hm_pos", notWritten.empty()? "": ", ", stats.noCoord); notWritten += part;}
-   if(stats.noOtherAllele){snprintf(part, sizeof(part), "%s%d without other allele", notWritten.empty()? "": ", ", stats.noOtherAllele); notWritten += part;}
-   if(stats.sameAllele){snprintf(part, sizeof(part), "%s%d with other allele = effect allele", notWritten.empty()? "": ", ", stats.sameAllele); notWritten += part;}
-   if(unsupportedAlleles){snprintf(part, sizeof(part), "%s%d with alleles other than single A/C/G/T", notWritten.empty()? "": ", ", unsupportedAlleles); notWritten += part;}
-   if(positionTooLarge){snprintf(part, sizeof(part), "%s%d with position above %ld", notWritten.empty()? "": ", ", positionTooLarge, MAX_BIN_POSITION); notWritten += part;}
-   if(stats.malformed){snprintf(part, sizeof(part), "%s%d lines without effect_allele/effect_weight", notWritten.empty()? "": ", ", stats.malformed); notWritten += part;}
    if(!notWritten.empty()) Appendf(out, " (not written: %s)", notWritten.c_str());
    Appendf(out, "\n");
-   if(written == 0) Appendf(out, "  Warning: %s has no SNPs.\n", outFile.c_str());
    #pragma omp critical(secretscores_output)
    {
       fputs(out.c_str(), stdout);
