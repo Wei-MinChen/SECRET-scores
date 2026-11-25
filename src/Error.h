@@ -1,17 +1,7 @@
-#ifndef _ERROR_H_
-#define _ERROR_H_
+#ifndef __ERROR_H__
+#define __ERROR_H__
 
-// #ifdef __cplusplus
-// extern "C" {
-// #endif
-
+// printf-style message, then exit(1)
 void error(const char * msg, ...);
-void warning(const char * msg, ...);
-void numerror(const char * msg, ...);
-
-// #ifdef __cplusplus
-//   };
-// #endif
-
 
 #endif

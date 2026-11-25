@@ -98,7 +98,7 @@ static const char *NotScoredChromosomes()
 
 // A score name has no white space, comma or double quote (the score file is tab-delimited, the
 // coverage file comma-delimited, and SECRET uses the names as column names); empty is SCORE.
-static std::string SafeScoreName(const std::string & name)
+std::string SafeScoreName(const std::string & name)
 {
    std::string nm = name;
    for(size_t i = 0; i < nm.size(); i++)
@@ -259,7 +259,7 @@ void WriteCoverageFile(const std::string & filename, const std::vector<CoverageR
 }
 
 // Parse a PGS Catalog text model without genotype data (see ScoreEngine.h).
-void ParseTextModel(const std::string & file, TextModelStats & stats, const SNPCallback & onSNP)
+void ParseTextModel(const std::string & file, TextModelStats & stats, const SNPCallback & onSNP, bool keepEffectOnly)
 {
    LineReader reader;
    FILE *test = fopen(file.c_str(), "rb");
@@ -325,12 +325,17 @@ void ParseTextModel(const std::string & file, TextModelStats & stats, const SNPC
       long pos;
       int chr = IsMissingValue(f[colCHR])? 0: ChromosomeCode(f[colCHR].c_str(), f[colCHR].size());
       if(chr == 0 || !ParsePosition(f[colPOS], pos)){stats.noCoord++; continue;}
-      // the other allele: other_allele, else hm_inferOtherAllele; a line without one is dropped
+      // the other allele: other_allele, else hm_inferOtherAllele; a line without one is dropped (kept for --makebin)
       std::string oa;
       if(colOA != -1 && !IsMissingValue(f[colOA])) oa = Upper(f[colOA]);
       else if(colHMOA != -1 && !IsMissingValue(f[colHMOA])) oa = Upper(f[colHMOA]);
-      if(oa.empty()){stats.noOtherAllele++; continue;}
-      if(oa == ea){stats.sameAllele++; continue;}
+      bool effectOnly = false;
+      if(oa.empty()){stats.noOtherAllele++; effectOnly = true;}
+      else if(oa == ea){stats.sameAllele++; effectOnly = true;}
+      if(effectOnly){
+         if(!keepEffectOnly) continue;
+         oa.clear();
+      }
       // allelefrequency_effect: the frequency of the effect allele; NaN when missing or not in [0, 1]
       double af = std::numeric_limits<double>::quiet_NaN();
       if(colAF != -1 && !IsMissingValue(f[colAF])){
@@ -665,14 +670,12 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
    // ---- the files ----
    if(binfile.find(',') != std::string::npos)
       error("Multiple genotype files cannot be read currently.");
-   plinkinput = binfile;
-   if(binfile.size() > 4 && binfile.substr(binfile.size() - 4) == ".bed")
-      plinkinput = binfile.substr(0, binfile.size() - 4);
-   printf("Loading genotype data in PLINK binary format...\n");
-   ReadPlinkFam(plinkinput);
-   ReadPlinkBim(plinkinput);
+   printf("Loading genotype data in %s...\n", genotypeFormat == GENO_VCF? "VCF format":
+      genotypeFormat == GENO_PGEN? "PLINK 2 format (pgen)": "PLINK binary format");
+   LoadSamplesAndVariants(binfile);
    if(bimCount == 0)
-      error("No SNPs were found in %s.bim", plinkinput.c_str());
+      error("No SNPs were found in %s", genotypeFormat == GENO_VCF? plinkinput.c_str():
+         genotypeFormat == GENO_PGEN? (plinkinput + ".pvar").c_str(): (plinkinput + ".bim").c_str());
    if(!readFreqFile.empty()){
       if(MeanImputation) ReadFreqFile(readFreqFile);
       else printf("--readfreq %s is not read: the frequencies are only used for mean imputation (off with --no-mean-imputation)\n",
@@ -794,12 +797,19 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
 
    // ---- options in effect ----
    printf("\nOptions in effect:\n");
+   if(genotypeFormat == GENO_VCF) printf("\t--vcf %s\n", inputName.c_str());
+   else if(genotypeFormat == GENO_PGEN) printf("\t--pfile %s\n", inputName.c_str());
+   else printf("\t--bfile %s\n", inputName.c_str());
    if(!optionReadModel.empty())
       printf("\t--readmodel %s\n", optionReadModel.c_str());
    if(!optionReadList.empty())
       printf("\t--readlist %s\n", optionReadList.c_str());
    if(!readFreqFile.empty())
       printf("\t--readfreq %s%s\n", readFreqFile.c_str(), MeanImputation? "": " (not used: --no-mean-imputation)");
+   if(!keepFile.empty())
+      printf("\t--keep %s\n", keepFile.c_str());
+   if(!removeFile.empty())
+      printf("\t--remove %s\n", removeFile.c_str());
    if(!MeanImputation)
       printf("\t--no-mean-imputation\n");
    if(CoreCount > 0)
@@ -828,13 +838,22 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
          }
          printf("X chromosome: %lld SNPs of the models are on it and are scored (--allowX %d: %s)\n",
             xEntries, XChrModel, XChrModel == 1? "males 0/1, females 0/1/2": "males and females 0/1/2");
-         printf("  Sex in %s.fam: %d male%s, %d female%s, %d unknown (scored as females)\n", plinkinput.c_str(),
+         if(sampleSexSource.empty() && genotypeFormat != GENO_BED)
+            printf("  The input has no sex: all %d samples are of unknown sex and are scored as females\n", idCount);
+         else
+         printf("  Sex in %s%s%s: %d male%s, %d female%s, %d unknown (scored as females)\n", plinkinput.c_str(),
+            genotypeFormat == GENO_PGEN? ".psam": ".fam",
+            (keepFile.empty() && removeFile.empty())? "": " (the samples used)",
             males, males == 1? "": "s", females, females == 1? "": "s", unknown);
          if(males == 0)
-            printf("  Warning: no sample is male in the .fam file, so no heterozygous genotype can be recognized as\n"
-                   "  impossible at X SNPs; all the samples are scored as diploid, as stored in the .bed file\n");
-         printf("  The pseudo-autosomal regions need to be coded XY (25) in the .bim file (plink --split-x);\n"
-                "  heterozygous genotypes of males at X SNPs (chromosome 23) are taken as missing\n\n");
+            printf("  Warning: no sample is male in the %s, so no heterozygous genotype can be recognized as\n"
+                   "  impossible at X SNPs; all the samples are scored as diploid, as stored in the genotype data\n",
+                   sampleFileLabel.c_str());
+         if(genotypeFormat == GENO_BED)
+            printf("  The pseudo-autosomal regions need to be coded XY (25) in the .bim file (plink --split-x);\n");
+         else
+            printf("  The pseudo-autosomal regions need to be coded XY (25) in the variant file (plink --split-x);\n");
+         printf("  heterozygous genotypes of males at X SNPs (chromosome 23) are taken as missing\n\n");
          fflush(stdout);
       }
    }
@@ -844,19 +863,19 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
       double available = AvailableMemory();
       if(available > 0){
          GENOTYPE_MEMORY_LIMIT = (long long)(available / 2);
-         String a = MemoryInfo(available);
-         String b = MemoryInfo((double) GENOTYPE_MEMORY_LIMIT);
+         std::string a = MemoryInfo(available);
+         std::string b = MemoryInfo((double) GENOTYPE_MEMORY_LIMIT);
          printf("Available RAM is %s; GENOTYPE_MEMORY_LIMIT is set to half of it, %s\n",
-            (const char*) a, (const char*) b);
+            a.c_str(), b.c_str());
       }else{
-         String b = MemoryInfo((double) GENOTYPE_MEMORY_LIMIT);
-         printf("The available RAM cannot be detected; GENOTYPE_MEMORY_LIMIT is %s\n", (const char*) b);
+         std::string b = MemoryInfo((double) GENOTYPE_MEMORY_LIMIT);
+         printf("The available RAM cannot be detected; GENOTYPE_MEMORY_LIMIT is %s\n", b.c_str());
       }
    }
 
    // ---- the .bed file: SNP-major or individual-major, kept in memory individual-major ----
    threadCount = threads;
-   FILE *fp = OpenPLINKBinary();
+   OpenGenotypes();
 
    // ---- score the models, batch by batch ----
    slotOfRow.assign(bimCount, -1);
@@ -894,10 +913,10 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
             break;
       }
       if((long long)((touched.size() + 3) / 4) * idCount > GENOTYPE_MEMORY_LIMIT){
-         String need = MemoryInfo((double)((touched.size() + 3) / 4) * idCount);
-         String lim = MemoryInfo((double) GENOTYPE_MEMORY_LIMIT);
+         std::string need = MemoryInfo((double)((touched.size() + 3) / 4) * idCount);
+         std::string lim = MemoryInfo((double) GENOTYPE_MEMORY_LIMIT);
          printf("Warning: the genotypes of %s need %s, more than GENOTYPE_MEMORY_LIMIT (%s); loading them anyway.\n",
-            models[batchStart].name.c_str(), (const char*) need, (const char*) lim);
+            models[batchStart].name.c_str(), need.c_str(), lim.c_str());
       }
       std::vector<int> sortedRows(touched);
       std::sort(sortedRows.begin(), sortedRows.end());
@@ -910,9 +929,9 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
          fflush(stdout);
       }
       const time_t loadStart = time(NULL);
-      ReadPLINKBinary(fp, sortedRows);
+      ReadGenotypes(sortedRows);
       if(single)
-         printf("  PLINK binary genotypes at %d SNPs are loaded.\n", loadedCount);
+         printf("  Genotypes at %d SNPs are loaded.\n", loadedCount);
       else
          printf("  Genotypes loaded (%.0f s)\n", difftime(time(NULL), loadStart));
       long long entries = 0;
@@ -923,9 +942,9 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
       }
       // right before the scores are computed: say so, now (the computing can take very long)
       {
-         String tables = MemoryInfo((double) entries * (sizeof(int) + 4 * sizeof(double)));
+         std::string tables = MemoryInfo((double) entries * (sizeof(int) + 4 * sizeof(double)));
          printf("Computing the scores of %d model%s (%lld SNP entries, model tables %s) for %d individuals, %d thread%s...\n",
-            batchEnd - batchStart, batchEnd - batchStart == 1? "": "s", entries, (const char*) tables,
+            batchEnd - batchStart, batchEnd - batchStart == 1? "": "s", entries, tables.c_str(),
             idCount, threads, threads == 1? "": "s");
          fflush(stdout);
       }
@@ -947,7 +966,7 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
       for(size_t t = 0; t < touched.size(); t++) needed[touched[t]] = 0;
       batchStart = batchEnd;
    }
-   fclose(fp);
+   CloseGenotypes();
    if(maleHetX > 0)
       printf("%lld heterozygous genotypes of males at X-chromosome SNPs (outside the PAR) were taken as missing\n"
              "  (counted for each SNP of each model; if there are many, code the PAR as XY with plink --split-x)\n", maleHetX);
@@ -1032,7 +1051,7 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
    if(useFID)
       printf("Some IIDs appear in more than one family: IDs are written as FID_IID.\n");
    std::string scorefile = prefix + "_scores.txt";
-   fp = fopen(scorefile.c_str(), "wt");
+   FILE *fp = fopen(scorefile.c_str(), "wt");
    if(fp == NULL) error("Cannot open %s to write", scorefile.c_str());
    fprintf(fp, "IID");
    for(int k = 0; k < modelCount; k++)
@@ -1050,7 +1069,7 @@ void ScoreEngine::PrintGeneticRiskScore(const std::string & binfile, std::vector
    if(single){
       // ---- the score of one model, with the fraction of its SNPs that were genotyped ----
       std::string riskscorefile = prefix + "grs.txt";
-      fp = fopen(riskscorefile.c_str(), "wt");
+      FILE *fp = fopen(riskscorefile.c_str(), "wt");
       if(fp == NULL) error("Cannot open %s to write", riskscorefile.c_str());
       fprintf(fp, "%15s %15s %7s %14s\n", "FID", "IID", "InfoSNP", "Score");
       for(int i = 0; i < idCount; i++)

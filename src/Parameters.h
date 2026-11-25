@@ -1,271 +1,91 @@
+////////////////////////////////////////////////////////////////////////
+// Parameters.h
+//
+// Command line options of the form --name [value].
+//
+//   OptionString idDelim("_"); bool quiet = false; int cpus = 0; double maf = -1.0;
+//   BEGIN_LONG_PARAMETERS(options)
+//      LONG_PARAMETER_GROUP("Input")
+//         LONG_STRINGPARAMETER("id-delim", &idDelim)
+//      LONG_PARAMETER_GROUP("Output")
+//         LONG_PARAMETER("quiet", &quiet)
+//         LONG_INTPARAMETER("cpus", &cpus)
+//         LONG_DOUBLEPARAMETER("maf", &maf)
+//   END_LONG_PARAMETERS()
+//   ParameterList pl;
+//   pl.Add(new LongParameters("Options", options));
+//   pl.Read(argc, argv);
+//   pl.Status();
+//
+//      SHORT_STRINGPARAMETER("b", &binfile)      gives  -b <value> or -b<value>
+//
+// Option names are not case sensitive and may be shortened to any prefix that
+// is unique (an exact name always wins over longer names that start with it).
+// A value option needs a value, and a number must be a number: otherwise the
+// program stops with an error.  Unknown or ambiguous options and loose words
+// are reported as warnings.
+////////////////////////////////////////////////////////////////////////
 #ifndef __PARAMETERS_H__
 #define __PARAMETERS_H__
 
-#include "StringMap.h"
+#include <string>
+#include <vector>
 
-#include <ctype.h>
-#include <stddef.h>
-
-class ParameterList;
-
-class Parameter
-   {
-   protected:
-      char ch;
-      char * description;
-      void * var;
-
-      static int nameCol;
-      static int statusCol;
-
-      virtual void Translate(const char * value) = 0;
-      virtual bool TranslateExtras(const char * value, const char * extras);
-
-      static bool CheckInteger(const char * value);
-      static bool CheckDouble(const char * value);
-
-      String * warnings;
-
-   public:
-
-      Parameter(char c, const char * desc, void * v);
-
-      virtual ~Parameter()
-         {
-         delete [] description;
-         }
-
-      virtual bool Read(int argc, char ** argv, int argn);
-      virtual void Status() = 0;
-
-      static void SetNameLen(int len) { nameCol = len; }
-      static void SetStatusLen(int len) { statusCol = len; }
-
-      void SetWarningBuffer(String & buffer) { warnings = &buffer; }
-      void warning(const char * format, ...);
-
-      friend class ParameterList;
-   };
-
-class IntParameter : public Parameter
+// The value of a string option: the text, read as a C string
+class OptionString
    {
    public:
-      IntParameter(char c, const char * desc, int & v)
-         : Parameter(c, desc, &v)
-         {}
-
-      virtual void Status();
-
-   protected:
-      virtual void Translate(const char * value);
-      virtual bool TranslateExtras(const char * value, const char * extras);
+      OptionString() {}
+      OptionString(const char *text) : text_(text ? text : "") {}
+      OptionString &operator=(const char *text) { text_ = text ? text : ""; return *this; }
+      operator const char *() const { return text_.c_str(); }
+      bool IsEmpty() const { return text_.empty(); }
+      int Length() const { return (int) text_.size(); }
+   private:
+      std::string text_;
    };
 
-class HiddenInteger : public IntParameter
+enum OptionKind { OPTION_END, OPTION_GROUP, OPTION_FLAG, OPTION_STRING, OPTION_INT, OPTION_DOUBLE, OPTION_SHORT_STRING };
+
+struct OptionDef
+   {
+   OptionKind kind;
+   const char *name;       // option name without the dashes (for a group: its title)
+   void *var;              // bool, OptionString, int or double (an OptionString for a short option)
+   };
+
+#define BEGIN_LONG_PARAMETERS(list)         OptionDef list[] = {
+#define LONG_PARAMETER_GROUP(title)         { OPTION_GROUP, title, 0 },
+#define LONG_PARAMETER(name, var)           { OPTION_FLAG, name, var },
+#define LONG_STRINGPARAMETER(name, var)     { OPTION_STRING, name, var },
+#define LONG_INTPARAMETER(name, var)        { OPTION_INT, name, var },
+#define LONG_DOUBLEPARAMETER(name, var)     { OPTION_DOUBLE, name, var },
+// a one-letter option with a value, written -b <value> or -b<value> (the letter is case sensitive)
+#define SHORT_STRINGPARAMETER(letter, var)  { OPTION_SHORT_STRING, letter, var },
+#define END_LONG_PARAMETERS()               { OPTION_END, 0, 0 } };
+
+class LongParameters
    {
    public:
-      HiddenInteger(char c, const char * desc, int & v)
-         : IntParameter(c, desc, v)
-         {}
-
-      virtual void Status() { }
-   };
-
-
-class SwitchParameter : public Parameter
-   {
-   public:
-      SwitchParameter(char c, const char * desc, bool & v)
-         : Parameter(c, desc, &v)
-         {}
-
-      virtual void Status();
-
-   protected:
-      virtual void Translate(const char * value);
-   };
-
-class HiddenSwitch : public SwitchParameter
-   {
-   public:
-      HiddenSwitch(char c, const char * desc, bool & v)
-         : SwitchParameter(c, desc, v)
-         {}
-
-      virtual void Status() { }
-   };
-
-class DoubleParameter : public Parameter
-   {
-   public:
-   DoubleParameter(char c, const char * desc, double & v);
-
-   virtual void Status();
-
-   protected:
-      virtual void Translate(const char * value);
-      virtual bool TranslateExtras(const char * value, const char * extras);
-   };
-
-class HiddenDouble : public DoubleParameter
-   {
-   public:
-      HiddenDouble(char c, const char * desc, double &v)
-         : DoubleParameter(c, desc, v)
-         {}
-
-      virtual void Status() { }
-   };
-
-class StringParameter : public Parameter
-   {
-   public:
-   StringParameter(char c, const char * desc, String & v, bool allowBlank = true)
-      : Parameter(c, desc, &v)
-      { required = !allowBlank; }
-
-   virtual void Status();
-
-   protected:
-      bool required;
-
-      virtual void Translate(const char * value);
-      virtual bool TranslateExtras(const char * value, const char * extras);
-   };
-
-class HiddenString : public StringParameter
-   {
-   public:
-      HiddenString(char c, const char * desc, String & v)
-         : StringParameter(c, desc, v)
-         {}
-
-      virtual void Status() { }
-   };
-
-struct OptionList
-   {
-   char     ch;
-   char *   description;
-   int      code;
-   };
-
-#define BEGIN_OPTION_LIST(name)     ; OptionList name[] = {
-#define END_OPTION_LIST(none)       , {0, none, 0} };
-
-class ListParameter : public Parameter
-   {
-   public:
-   ListParameter(char c, const char * desc, int & v, OptionList * opt);
-
-   virtual void Status();
-
-   protected:
-      String       key;
-      OptionList * options;
-      virtual void Translate(const char * value);
-   };
-
-class SetParameter : public Parameter
-   {
-   public:
-   SetParameter(char c, const char * desc, int & v, OptionList * opt);
-
-   virtual void Status();
-
-   protected:
-      String       key;
-      OptionList * options;
-      virtual void Translate(const char * value);
-   };
-
-struct LongParameterList
-   {
-   const char * description;
-   void * value;
-   bool exclusive;
-   int  type;
-   };
-
-#define LP_BOOL_PARAMETER     1
-#define LP_INT_PARAMETER      2
-#define LP_DOUBLE_PARAMETER   3
-#define LP_STRING_PARAMETER   4
-#define LP_LEGACY_PARAMETERS  99
-
-#define BEGIN_LONG_PARAMETERS(array)   LongParameterList array[] = {\
-                                              { NULL,  NULL,      false,  0 },
-#define LONG_PARAMETER_GROUP(label)           { label, NULL,      false,  0 },
-#define LONG_PARAMETER(label,boolptr)         { label, boolptr,   false,  1 },
-#define EXCLUSIVE_PARAMETER(label,boolptr)    { label, boolptr,   true,   1 },
-#define LONG_INTPARAMETER(label,intptr)       { label, intptr,    false,  2 },
-#define LONG_SMARTINTPARAMETER(label,intptr)  { label, intptr,    true,   2 },
-#define LONG_DOUBLEPARAMETER(label,doubleptr) { label, doubleptr, false,  3 },
-#define LONG_STRINGPARAMETER(label,stringptr) { label, stringptr, false,  4 },
-#define BEGIN_LEGACY_PARAMETERS()             { "$$$", NULL,      false, 99 },
-#define END_LONG_PARAMETERS()                 { NULL,  NULL,      false,  0 }};
-
-class LongParameters : public Parameter
-   {
-   public:
-      LongParameters(const char * desc, LongParameterList * list);
-
-      virtual void Status();
-
-   protected:
-      StringMap index;
-      StringMap legacyIndex;
-      
-      LongParameterList * list;
-      int group_len;
-
-      virtual void Translate(const char * value);
-      virtual bool TranslateExtras(const char * value, const char * extras);
+      LongParameters(const char *title, OptionDef *defs) : title_(title), defs_(defs) {}
+      const std::string &Title() const { return title_; }
+      OptionDef *Defs() const { return defs_; }
+   private:
+      std::string title_;
+      OptionDef *defs_;
    };
 
 class ParameterList
    {
-   protected:
-      Parameter ** pl;
-      int count;
-      int size;
-
-      void MakeString(int argc, char ** argv, int start = 1);
-
    public:
-      char * string;
-
-      ParameterList(int s = 36)
-         {
-         size = s;
-         count = 0;
-         pl = new Parameter * [size];
-         string = NULL;
-         }
-
-      virtual ~ParameterList();
-
-      void Add(Parameter * p);
-
-      // Tries to process all command line arguments
-      virtual void Read(int argc, char ** argv, int start = 1);
-
-      // Allows for trailing, unprocessed, filenames in the command line
-      // The number of translated argv[] items is returned
-      virtual int ReadWithTrailer(int argc, char ** argv, int start = 1);
-
-      // Outputs summary of parameter switches and settings
-      virtual void Status();
-
-      // Keeps track of warnings generated during parameter processing
-      String  warnings;
-      String  messages;
-
-      // Functions that gracefully enforce parameter settings
-      void Enforce(bool & var, bool value, const char * reason, ...);
-      void Enforce(int & var, int value, const char * reason, ...);
-      void Enforce(double & var, double value, const char * reason, ...);
-      void Enforce(String & var, const char * value, const char * reason, ...);
+      ~ParameterList();
+      void Add(LongParameters *p) { lists_.push_back(p); }       // the list takes ownership
+      void Read(int argc, char **argv);                          // sets the variables
+      void Status();                                             // prints the settings and the warnings to the screen
+      const std::string &Warnings() const { return warnings_; }  // problems found by Read (empty = none)
+   private:
+      std::vector<LongParameters *> lists_;
+      std::string warnings_;
    };
 
 #endif

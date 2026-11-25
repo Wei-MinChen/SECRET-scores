@@ -17,8 +17,8 @@
 ////////////////////////////////////////////////////////////////////////
 
 // release: VERSION is defined; debug mode: comment it out (the banner then shows the date instead of
-// the version, and the debug-only options --blocksize and --batchmodels are available)
-#define VERSION "1.0.2"
+// the version, and the debug-only options --blocksize, --batchmodels and --sex-maxsnps are available)
+#define VERSION "1.0.4"
 
 #include <time.h>
 #include <stdlib.h>
@@ -26,9 +26,8 @@
 #include <string>
 #include <vector>
 #include "Parameters.h"
-#include "StringArray.h"
 #include "ScoreEngine.h"
-#include "InputFile.h"
+#include <zlib.h>
 #include "Error.h"
 
 void ShowBanner(bool toStderr)
@@ -57,16 +56,44 @@ static std::string TrimBlanks(const std::string & s)
    return s.substr(b, e - b);
 }
 
+// "a,b,,c" -> a, b, c (empty items are dropped)
+static std::vector<std::string> SplitCommas(const char *text)
+{
+   std::vector<std::string> items;
+   std::string item;
+   for(const char *p = text; ; p++){
+      if(*p == ',' || *p == 0){
+         if(!item.empty()) items.push_back(item);
+         item.clear();
+         if(*p == 0) break;
+      }else item += *p;
+   }
+   return items;
+}
+
+// the next line of a text file (plain or .gz) without the end of line; false at the end of the file
+static bool ReadTextLine(gzFile input, std::string & line)
+{
+   line.clear();
+   char buffer[4096];
+   bool any = false;
+   while(gzgets(input, buffer, sizeof(buffer)) != NULL){
+      any = true;
+      line += buffer;
+      if(!line.empty() && line[line.size() - 1] == '\n') break;
+   }
+   while(!line.empty() && (line[line.size() - 1] == '\n' || line[line.size() - 1] == '\r')) line.erase(line.size() - 1);
+   return any;
+}
+
 static void ReadModelList(const char *listfile, std::vector<std::string> & files, std::vector<std::string> & names)
 {
-   IFILE input = ifopen(listfile, "rt");
+   gzFile input = gzopen(listfile, "rb");
    if(input == NULL) error("Cannot open %s to read", listfile);
-   String line;
+   std::string text;
    int lineNumber = 0, listed = 0;
-   while(!ifeof(input)){
-      line.ReadLine(input);
+   while(ReadTextLine(input, text)){
       lineNumber++;
-      std::string text((const char*) line);
       if(lineNumber == 1 && text.compare(0, 3, "\xEF\xBB\xBF") == 0) text.erase(0, 3);    // a UTF-8 byte order mark
       // blank lines and comments are skipped; trailing blanks and leading spaces go, but a leading
       // tab is an empty first column (an error, as the first column is always the model file)
@@ -105,7 +132,7 @@ static void ReadModelList(const char *listfile, std::vector<std::string> & files
       names.push_back(column.size() > 1? column[1]: std::string());
       listed++;
    }
-   ifclose(input);
+   gzclose(input);
    if(listed == 0) error("No model files are listed in %s", listfile);
 }
 
@@ -127,16 +154,25 @@ int main(int argc, char **argv)
    setvbuf(stdout, NULL, viewbinArg? _IOFBF: _IOLBF, viewbinArg? 1 << 16: 0);
    ShowBanner(viewbinArg);
 
-   String binfile;
+   OptionString binfile;
+   OptionString vcffile("");
+   OptionString pfilePrefix("");
    ParameterList pl;
    bool makebinFlag = false;
    bool viewbinFlag = false;
    bool scoreFlag = false;
-   String weightfile("");
-   String listfile("");
-   String freqfile("");
+   bool inferABOFlag = false;
+   bool inferAPOEFlag = false;
+   bool apoePartialFlag = false;
+   bool inferSexFlag = false;
+   int sexMaxSnps = 50000;
+   OptionString weightfile("");
+   OptionString listfile("");
+   OptionString freqfile("");
+   OptionString keepfile("");
+   OptionString removefile("");
    bool noMeanImputation = false;
-   String prefix("secretscores");
+   OptionString prefix("secretscores");
    int CoreCount = 0;
    int allowX = 0;
    int blockSize = 0;
@@ -144,13 +180,27 @@ int main(int argc, char **argv)
 
    BEGIN_LONG_PARAMETERS(longParameters)
       LONG_PARAMETER_GROUP("Input Files")
+         LONG_STRINGPARAMETER("bfile", &binfile)
+         LONG_STRINGPARAMETER("vcf", &vcffile)
+         LONG_STRINGPARAMETER("pfile", &pfilePrefix)
          LONG_STRINGPARAMETER("readmodel", &weightfile)
          LONG_STRINGPARAMETER("readlist", &listfile)
          LONG_STRINGPARAMETER("readfreq", &freqfile)
+      LONG_PARAMETER_GROUP("Sample Filter")
+         LONG_STRINGPARAMETER("keep", &keepfile)
+         LONG_STRINGPARAMETER("remove", &removefile)
       LONG_PARAMETER_GROUP("Score Action")
          LONG_PARAMETER("score", &scoreFlag)
          LONG_PARAMETER("makebin", &makebinFlag)
          LONG_PARAMETER("viewbin", &viewbinFlag)
+      LONG_PARAMETER_GROUP("Inferences")
+         LONG_PARAMETER("inferABO", &inferABOFlag)
+         LONG_PARAMETER("inferAPOE", &inferAPOEFlag)
+         LONG_PARAMETER("apoe-partial", &apoePartialFlag)
+         LONG_PARAMETER("infersex", &inferSexFlag)
+#ifndef VERSION
+         LONG_INTPARAMETER("sex-maxsnps", &sexMaxSnps)
+#endif
       LONG_PARAMETER_GROUP("Score Parameter")
          LONG_PARAMETER("no-mean-imputation", &noMeanImputation)
          LONG_INTPARAMETER("allowX", &allowX)
@@ -164,8 +214,7 @@ int main(int argc, char **argv)
          LONG_STRINGPARAMETER("prefix", &prefix)
    END_LONG_PARAMETERS()
 
-   pl.Add(new StringParameter('b', "Binary File", binfile));
-   pl.Add(new LongParameters("Additional Options", longParameters));
+   pl.Add(new LongParameters("Options", longParameters));
    pl.Read(argc, argv);
    if(!viewbinFlag) pl.Status();
 
@@ -179,32 +228,43 @@ int main(int argc, char **argv)
       // print one binary model as a text model: secretscores --viewbin --readmodel model.bin
       if(makebinFlag) ViewbinFail("--viewbin and --makebin cannot be used together.");
       if(!listfile.IsEmpty()) ViewbinFail("--viewbin shows a single model: use --readmodel <file.bin>, not --readlist.");
-      StringArray files;
-      files.AddTokens(weightfile, ',');
-      int fileCount = 0;
-      for(int i = 0; i < files.Length(); i++)
-         if(!files[i].IsEmpty()) fileCount++;
+      const std::vector<std::string> files = SplitCommas(weightfile);
+      const int fileCount = (int) files.size();
       if(fileCount != 1)
          ViewbinFail("--viewbin shows a single model. Please use --readmodel <file.bin> with one binary model,\n"
             "  e.g.,  secretscores --viewbin --readmodel model.bin | more\n"
             "         secretscores --viewbin --readmodel model.bin > model.txt");
-      for(int i = 0; i < files.Length(); i++)
-         if(!files[i].IsEmpty()){
-            if(!IsBinaryModelName(std::string((const char*) files[i])))
-               ViewbinFail("--viewbin needs a SECRETS binary model (file name ending in .bin, made with --makebin).");
-            ViewBinaryModel(std::string((const char*) files[i]));
-         }
+      for(size_t i = 0; i < files.size(); i++){
+         if(!IsBinaryModelName(files[i]))
+            ViewbinFail("--viewbin needs a SECRETS binary model (file name ending in .bin, made with --makebin).");
+         ViewBinaryModel(files[i]);
+      }
       return 0;
    }
 
-   if(binfile.IsEmpty() && !makebinFlag)
-      error("Genotype files are required. e.g.,\n  secretscores --score -b ex.bed --readmodel model.txt\n"
+   {
+      const int inputs = (binfile.IsEmpty()? 0: 1) + (vcffile.IsEmpty()? 0: 1) + (pfilePrefix.IsEmpty()? 0: 1);
+      if(inputs > 1) error("Use only one of --bfile (PLINK binary), --vcf (VCF) and --pfile (PLINK 2 pgen) for the genotypes.");
+   }
+   if(binfile.IsEmpty() && vcffile.IsEmpty() && pfilePrefix.IsEmpty() && !makebinFlag)
+      error("Genotype files are required. e.g.,\n  secretscores --score --bfile ex.bed --readmodel model.txt\n"
+         "  secretscores --score --vcf ex.vcf.gz --readmodel model.txt\n"
+         "  secretscores --score --pfile ex --readmodel model.txt   (ex.pgen, ex.pvar, ex.psam)\n"
          "  (--score is optional: without --makebin or --viewbin, scores are calculated)\n\n"
          "The model file is a PGS Catalog harmonized scoring file. Its header needs the columns\n"
          "  effect_allele, effect_weight, hm_chr, hm_pos\n"
          "  and other_allele or hm_inferOtherAllele; or a SECRETS binary model (file name ending in .bin,\n"
          "  made from a text model with --makebin).");
-   if(weightfile.IsEmpty() && listfile.IsEmpty())
+   if(apoePartialFlag && !inferAPOEFlag)
+      error("--apoe-partial is used with --inferAPOE.");
+   if((int) inferABOFlag + (int) inferAPOEFlag + (int) inferSexFlag > 1)
+      error("--inferABO, --inferAPOE and --infersex are run one at a time.");
+   if(sexMaxSnps < 20) error("--sex-maxsnps %d is out of range (at least 20).", sexMaxSnps);
+   if((inferABOFlag || inferAPOEFlag || inferSexFlag) && (scoreFlag || makebinFlag))
+      error("--inferABO, --inferAPOE and --infersex cannot be used with --score or --makebin.");
+   if((inferABOFlag || inferAPOEFlag || inferSexFlag) && binfile.IsEmpty() && vcffile.IsEmpty() && pfilePrefix.IsEmpty())
+      error("--inferABO, --inferAPOE and --infersex need genotypes: --bfile, --vcf or --pfile.");
+   if(!inferABOFlag && !inferAPOEFlag && !inferSexFlag && weightfile.IsEmpty() && listfile.IsEmpty())
       error("Please use --readmodel <file> to specify a score model,\n  or --readlist <file> to specify a file with the names of score models.");
    if(CoreCount < 0)
       error("--cpus %d is out of range.", CoreCount);
@@ -229,23 +289,23 @@ int main(int argc, char **argv)
    // is a SECRETS binary model, any other file is a PGS Catalog text model.
    std::vector<std::string> modelFiles, modelNames;
    if(!weightfile.IsEmpty()){
-      StringArray files;
-      files.AddTokens(weightfile, ',');
-      for(int i = 0; i < files.Length(); i++)
-         if(!files[i].IsEmpty()){
-            modelFiles.push_back((const char*) files[i]);
-            modelNames.push_back("");
-         }
+      const std::vector<std::string> files = SplitCommas(weightfile);
+      for(size_t i = 0; i < files.size(); i++){
+         modelFiles.push_back(files[i]);
+         modelNames.push_back("");
+      }
    }
    if(!listfile.IsEmpty())
       ReadModelList((const char*) listfile, modelFiles, modelNames);
-   if(modelFiles.empty())
+   if(modelFiles.empty() && !inferABOFlag && !inferAPOEFlag && !inferSexFlag)
       error("Please use --readmodel <file> to specify a score model,\n  or --readlist <file> to specify a file with the names of score models.");
 
    if(makebinFlag){
       // convert text models to binary models: no genotypes are read
-      if(!binfile.IsEmpty())
-         printf("--makebin only converts the models; the genotype data (-b) are not used.\n");
+      if(!binfile.IsEmpty() || !vcffile.IsEmpty() || !pfilePrefix.IsEmpty())
+         printf("--makebin only converts the models; the genotype data (--bfile, --vcf, --pfile) are not used.\n");
+      if(!keepfile.IsEmpty() || !removefile.IsEmpty())
+         printf("--makebin only converts the models; --keep and --remove are not used.\n");
       if(!freqfile.IsEmpty())
          printf("--makebin only converts the models; --readfreq is not used (the frequencies in the\n"
                 "  allelefrequency_effect column of the models are stored in the binary models).\n");
@@ -262,9 +322,23 @@ int main(int argc, char **argv)
    engine.optionReadModel = (const char*) weightfile;
    engine.optionReadList = (const char*) listfile;
    engine.readFreqFile = (const char*) freqfile;
+   engine.keepFile = (const char*) keepfile;
+   engine.removeFile = (const char*) removefile;
    engine.CoreCount = CoreCount;
    engine.readBlockMB = blockSize;
    engine.maxBatchModels = batchModels;
-   engine.PrintGeneticRiskScore((const char*) binfile, modelFiles, modelNames);
+   std::string genotypeName = (const char*) binfile;
+   engine.genotypeFormat = GENO_BED;
+   if(!vcffile.IsEmpty()){engine.genotypeFormat = GENO_VCF; genotypeName = (const char*) vcffile;}
+   else if(!pfilePrefix.IsEmpty()){engine.genotypeFormat = GENO_PGEN; genotypeName = (const char*) pfilePrefix;}
+   if(inferABOFlag || inferAPOEFlag || inferSexFlag){
+      if(inferABOFlag) engine.InferABO(genotypeName);
+      else if(inferSexFlag){engine.sexMaxSnps = sexMaxSnps; engine.InferSex(genotypeName);}
+      else{engine.apoePartial = apoePartialFlag; engine.InferAPOE(genotypeName);}
+      timer = time(NULL);
+      printf("secretscores ends at %s", asctime(localtime(&timer)));
+      return 0;
+   }
+   engine.PrintGeneticRiskScore(genotypeName, modelFiles, modelNames);
    return 0;
 }

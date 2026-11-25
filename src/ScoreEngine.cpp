@@ -27,11 +27,22 @@
 #include <math.h>
 #include <unordered_map>
 #include "ScoreEngine.h"
+#include "PgenReader.h"
 #include "Error.h"
 
 ScoreEngine::ScoreEngine()
 {
+   pgenReader = NULL;
+   bedFile = NULL;
+   wantVariantIds = false;
+   apoePartial = false;
+   sexMaxSnps = 50000;
+   pgenRecordCount = 0;
+   genotypeFormat = GENO_BED;
+   sampleHasFID = true;
+   sampleFileLabel = ".fam file";
    idCount = 0;
+   famCount = 0;
    bimCount = 0;
    bimSorted = true;
    G_IND = NULL;
@@ -50,6 +61,7 @@ ScoreEngine::ScoreEngine()
 
 ScoreEngine::~ScoreEngine()
 {
+   delete pgenReader;
    if(G_IND){
       for(int i = 0; i < idCount; i++)
          delete []G_IND[i];
@@ -191,7 +203,7 @@ unsigned int AlleleCode(const char *label, size_t length)
 static bool IsSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 
 // the first n white-space separated tokens of a line; returns how many there are (up to n)
-static int Tokens(const char *line, const char **start, size_t *length, int n)
+int Tokens(const char *line, const char **start, size_t *length, int n)
 {
    int count = 0;
    const char *p = line;
@@ -222,7 +234,7 @@ static void SplitFieldsPublic(const char *s, std::vector<std::string> & fields)
 }
 
 // open name+extension, or name+extension+".gz" when there is no such file
-static bool OpenText(LineReader & reader, const std::string & name, const char *extension, std::string & opened)
+bool OpenText(LineReader & reader, const std::string & name, const char *extension, std::string & opened)
 {
    opened = name + extension;
    FILE *test = fopen(opened.c_str(), "rb");
@@ -235,11 +247,65 @@ static bool OpenText(LineReader & reader, const std::string & name, const char *
    return reader.Open(opened.c_str());
 }
 
+// --keep / --remove: a file of samples, as in PLINK: one sample per line, the family ID (FID) in the
+// first column and the within-family ID (IID) in the second, separated by white space.  Columns after the
+// second are ignored, and empty lines are skipped.  Plain or gzipped.  A line that starts with # is a header
+// line (PLINK 2 writes #FID IID or #IID) and is skipped.  A sample is held as FID + tab + IID; the flag says
+// whether the sample file has it (so that the IDs that are not in the sample file can be reported).
+// With a VCF or a .psam without family IDs (allowIidOnly) a line may have the IID alone (as PLINK 2 allows); it
+// is held as "\x01" + tab + IID and matches the sample with that IID, whatever its family.
+typedef std::unordered_map<std::string, bool> SampleIdSet;
+
+static void ReadSampleIdFile(const std::string & filename, const char *option, SampleIdSet & ids, bool allowIidOnly)
+{
+   LineReader reader;
+   FILE *test = fopen(filename.c_str(), "rb");
+   if(test == NULL) error("Cannot open %s to read (%s)", filename.c_str(), option);
+   fclose(test);
+   if(!reader.Open(filename.c_str())) error("Cannot open %s to read (%s)", filename.c_str(), option);
+   const char *line;
+   size_t length;
+   const char *tk[3];
+   size_t tl[3];
+   long long lineNumber = 0;
+   while(reader.Next(line, length)){
+      lineNumber++;
+      if(lineNumber == 1 && strncmp(line, "\xEF\xBB\xBF", 3) == 0) line += 3;     // a UTF-8 byte order mark
+      const int n = Tokens(line, tk, tl, 3);
+      if(n == 0) continue;
+      if(tk[0][0] == '#') continue;                        // a header line
+      if(n < 2 && !allowIidOnly)
+         error("Line %lld of the %s file %s has fewer than 2 columns.\n"
+            "  The file needs the family ID (FID) in the first column and the individual ID (IID) in the second,\n"
+            "  with no header line.", lineNumber, option, filename.c_str());
+      std::string key;
+      if(n < 2){
+         key = "\x01\t";
+         key.append(tk[0], tl[0]);
+      }else{
+         key.assign(tk[0], tl[0]);
+         key += '\t';
+         key.append(tk[1], tl[1]);
+      }
+      ids[key] = false;
+   }
+   std::string why;
+   if(reader.Failed(why))
+      error("Cannot read %s completely (%s): the file may be truncated or damaged", filename.c_str(), why.c_str());
+   reader.Close();
+   if(ids.empty()) error("The %s file %s has no samples", option, filename.c_str());
+}
+
+static long long CountFound(const SampleIdSet & ids)
+{
+   long long found = 0;
+   for(SampleIdSet::const_iterator it = ids.begin(); it != ids.end(); ++it)
+      if(it->second) found++;
+   return found;
+}
+
 void ScoreEngine::ReadPlinkFam(const std::string & filename)
 {
-   FID.clear();
-   IID.clear();
-   sex.clear();
    LineReader reader;
    std::string opened;
    if(!OpenText(reader, filename, ".fam", opened))
@@ -249,28 +315,99 @@ void ScoreEngine::ReadPlinkFam(const std::string & filename)
    size_t length;
    const char *tk[6];
    size_t tl[6];
+   std::vector<std::string> fids, iids;
+   std::vector<unsigned char> sexes;
    while(reader.Next(line, length)){
       // a .fam line has 6 fields; FID, IID and the sex (field 5) are used (the order of the
       // people is the file's).  Sex: 1 male, 2 female, anything else unknown.
       if(Tokens(line, tk, tl, 6) < 6) continue;
-      FID.push_back(std::string(tk[0], tl[0]));
-      IID.push_back(std::string(tk[1], tl[1]));
-      sex.push_back((tl[4] == 1 && tk[4][0] == '1')? 1: (tl[4] == 1 && tk[4][0] == '2')? 2: 0);
+      fids.push_back(std::string(tk[0], tl[0]));
+      iids.push_back(std::string(tk[1], tl[1]));
+      sexes.push_back((tl[4] == 1 && tk[4][0] == '1')? 1: (tl[4] == 1 && tk[4][0] == '2')? 2: 0);
    }
    {
       std::string why;
       if(reader.Failed(why)) error("Cannot read %s completely (%s): the file may be truncated or damaged", opened.c_str(), why.c_str());
    }
-   idCount = (int) IID.size();
-   printf("  PLINK fam loaded: %d samples\n", idCount);
+   sampleFileLabel = ".fam file";
+   sampleHasFID = true;
+   SelectSamples(fids, iids, sexes, "PLINK fam");
 }
 
-// Read every row of the .bim file.  Row r of the .bim file is row r of the .bed
-// file, whatever its chromosome, so all rows are kept and the SNPs that cannot
-// be scored (not on chromosomes 1-22, X or XY) are only counted.
+// The samples of the genotype data, in file order, are fids / iids / sexes (1 male, 2 female, 0 unknown).
+// --keep, then --remove: a sample is used when it is listed in the --keep file (if there is one) and is not
+// listed in the --remove file.  Sets FID, IID, sex, sampleRow (the file row of every sample that is used),
+// famToSample (the sample that is used at every file row, -1 when it is not used), famCount and idCount.
+void ScoreEngine::SelectSamples(const std::vector<std::string> & fids, const std::vector<std::string> & iids,
+   const std::vector<unsigned char> & sexes, const char *loadedLabel)
+{
+   FID.clear();
+   IID.clear();
+   sex.clear();
+   sampleRow.clear();
+   famToSample.clear();
+   const bool haveKeep = !keepFile.empty(), haveRemove = !removeFile.empty();
+   const bool iidOnly = !sampleHasFID;                    // a one-column line is allowed
+   SampleIdSet keepIds, removeIds;
+   if(haveKeep) ReadSampleIdFile(keepFile, "--keep", keepIds, iidOnly);
+   if(haveRemove) ReadSampleIdFile(removeFile, "--remove", removeIds, iidOnly);
+   const int rows = (int) iids.size();
+   int afterKeep = 0;
+   std::string key, iidKey;
+   for(int row = 0; row < rows; row++){
+      bool passKeep = true, listedRemove = false;
+      if(haveKeep || haveRemove){
+         key = fids[row] + '\t' + iids[row];
+         iidKey = "\x01\t" + iids[row];
+         if(haveKeep){
+            SampleIdSet::iterator it = keepIds.find(key);
+            SampleIdSet::iterator it2 = keepIds.find(iidKey);
+            passKeep = (it != keepIds.end()) || (it2 != keepIds.end());
+            if(it != keepIds.end()) it->second = true;
+            if(it2 != keepIds.end()) it2->second = true;
+         }
+         if(haveRemove){
+            SampleIdSet::iterator it = removeIds.find(key);
+            SampleIdSet::iterator it2 = removeIds.find(iidKey);
+            listedRemove = (it != removeIds.end()) || (it2 != removeIds.end());
+            if(it != removeIds.end()) it->second = true;
+            if(it2 != removeIds.end()) it2->second = true;
+         }
+      }
+      if(passKeep) afterKeep++;
+      const bool use = passKeep && !listedRemove;
+      famToSample.push_back(use? (int) IID.size(): -1);
+      if(!use) continue;
+      sampleRow.push_back(row);
+      FID.push_back(fids[row]);
+      IID.push_back(iids[row]);
+      sex.push_back(sexes[row]);
+   }
+   famCount = rows;
+   idCount = (int) IID.size();
+   printf("  %s loaded: %d samples\n", loadedLabel, famCount);
+   if(haveKeep){
+      printf("  --keep %s: %d of %d samples kept (%lld IDs listed)\n", keepFile.c_str(), afterKeep, famCount,
+         (long long) keepIds.size());
+      const long long missing = (long long) keepIds.size() - CountFound(keepIds);
+      if(missing > 0) printf("  Note: %lld of the IDs in the --keep file are not in the %s\n", missing, sampleFileLabel.c_str());
+   }
+   if(haveRemove){
+      printf("  --remove %s: %d of %d samples removed (%lld IDs listed)\n", removeFile.c_str(), afterKeep - idCount,
+         afterKeep, (long long) removeIds.size());
+      const long long missing = (long long) removeIds.size() - CountFound(removeIds);
+      if(missing > 0) printf("  Note: %lld of the IDs in the --remove file are not in the %s\n", missing, sampleFileLabel.c_str());
+   }
+   if(haveKeep || haveRemove){
+      if(idCount == 0)
+         error("No samples remain after %s.", haveKeep && haveRemove? "--keep and --remove": haveKeep? "--keep": "--remove");
+      printf("  %d of %d samples remain for scoring\n", idCount, famCount);
+   }
+}
+
 // 64-bit FNV-1a hash of a SNP ID (case-sensitive); the IDs of a .bim file are matched to those of
 // a --readfreq file through it, so that 100 million IDs need 8 bytes each instead of strings.
-static unsigned long long IdHash(const char *label, size_t length)
+unsigned long long IdHash(const char *label, size_t length)
 {
    unsigned long long h = 1469598103934665603ULL;
    for(size_t i = 0; i < length; i++)
@@ -278,14 +415,84 @@ static unsigned long long IdHash(const char *label, size_t length)
    return h;
 }
 
-void ScoreEngine::ReadPlinkBim(const std::string & filename)
+// the position of a map file: digits only, 0 when there are none (or it is above INT_MAX)
+long ParsePositionToken(const char *p, size_t length)
+{
+   const char *e = p + length;
+   long long v = 0;
+   bool ok = (p < e);
+   for(; p < e; p++){
+      if(*p < '0' || *p > '9'){ok = false; break;}
+      v = v * 10 + (*p - '0');
+      if(v > INT_MAX){ok = false; break;}
+   }
+   return ok? (long) v: 0;
+}
+
+// The variant table is built by BeginVariantTable(), AddVariant() for every row and FinishVariantTable(), which
+// the .bim file, a VCF and a .pvar file all use.
+void ScoreEngine::BeginVariantTable()
 {
    bimChr.clear();
    bimPos.clear();
    bimA1.clear();
    bimA2.clear();
    bimIdHash.clear();
-   const bool keepIds = !readFreqFile.empty() && MeanImputation;     // IDs are only needed to match --readfreq
+   rowRecord.clear();
+   rowAlt.clear();
+   for(int c = 0; c < SEXCHR + 4; c++) varCounts[c] = 0;
+   bimSorted = true;
+   varPreviousKey = -1;
+}
+
+void ScoreEngine::AddVariant(int chr, long pos, unsigned int a1, unsigned int a2)
+{
+   bimChr.push_back((unsigned char) chr);
+   bimPos.push_back((int) pos);
+   bimA1.push_back(a1);
+   bimA2.push_back(a2);
+   varCounts[chr]++;
+   const long long key = ((long long) chr << 32) | (long long) pos;
+   if(key < varPreviousKey) bimSorted = false;
+   varPreviousKey = key;
+}
+
+void ScoreEngine::FinishVariantTable(const char *mapLabel)
+{
+   bimCount = (int) bimPos.size();
+   const long long *counts = varCounts;
+   // autosomes and XY; X is counted apart, and is scored unless --allowX 0
+   long long autosomes = counts[SEXCHR + 2];
+   for(int c = 1; c < SEXCHR; c++) autosomes += counts[c];
+   const long long scorable = autosomes + (ScoredChromosome(SEXCHR)? counts[SEXCHR]: 0);
+   const long long unrecognized = counts[0];
+   printf("  Genotype data consist of %lld autosome SNPs", autosomes);
+   if(counts[SEXCHR+2]) printf(" (including %lld XY SNPs)", counts[SEXCHR+2]);
+   if(counts[SEXCHR]) printf(", %lld X-chromosome SNPs%s", counts[SEXCHR], ScoredChromosome(SEXCHR)? "": " (not scored)");
+   if(counts[SEXCHR+1]) printf(", %lld Y-chromosome SNPs", counts[SEXCHR+1]);
+   if(counts[SEXCHR+3]) printf(", %lld mitochondrial SNPs", counts[SEXCHR+3]);
+   if(unrecognized) printf(", %lld SNPs on unrecognized chromosomes", unrecognized);
+   printf("\n");
+   if(scorable < bimCount)
+      printf("  %lld other SNPs cannot be scored.\n", (long long) bimCount - scorable);
+   // SNPs that are not in (chromosome, position) order (rare) are looked up through a sorted index
+   posIndex.clear();
+   if(!bimSorted){
+      printf("  The %s is not sorted by chromosome and position; building an index...\n", mapLabel);
+      for(int r = 0; r < bimCount; r++)
+         if(ScoredChromosome(bimChr[r]) && bimPos[r] > 0)
+            posIndex.push_back(std::make_pair(((long long) bimChr[r] << 32) | (long long) bimPos[r], r));
+      std::sort(posIndex.begin(), posIndex.end());
+   }
+}
+
+// Read every row of the .bim file.  Row r of the .bim file is row r of the .bed
+// file, whatever its chromosome, so all rows are kept and the SNPs that cannot
+// be scored (not on chromosomes 1-22, X or XY) are only counted.
+void ScoreEngine::ReadPlinkBim(const std::string & filename)
+{
+   BeginVariantTable();
+   const bool keepIds = wantVariantIds || (!readFreqFile.empty() && MeanImputation);     // IDs are only needed to match --readfreq
    LineReader reader;
    std::string opened;
    if(!OpenText(reader, filename, ".bim", opened))
@@ -318,66 +525,18 @@ void ScoreEngine::ReadPlinkBim(const std::string & filename)
    size_t length;
    const char *tk[6];
    size_t tl[6];
-   long long counts[SEXCHR + 4];
-   for(int c = 0; c < SEXCHR + 4; c++) counts[c] = 0;
-   long long unrecognized = 0;
-   bimSorted = true;
-   long long previousKey = -1;
    while(reader.Next(line, length)){
       if(Tokens(line, tk, tl, 6) < 6) continue;
-      int chr = ChromosomeCode(tk[0], tl[0]);
-      long pos = 0;
-      {
-         // the position: digits only, 0 when there are none
-         const char *p = tk[3], *e = tk[3] + tl[3];
-         long long v = 0;
-         bool ok = (p < e);
-         for(; p < e; p++){
-            if(*p < '0' || *p > '9'){ok = false; break;}
-            v = v * 10 + (*p - '0');
-            if(v > INT_MAX){ok = false; break;}
-         }
-         pos = ok? (long) v: 0;
-      }
-      bimChr.push_back((unsigned char) chr);
-      bimPos.push_back((int) pos);
-      bimA1.push_back(AlleleCode(tk[4], tl[4]));
-      bimA2.push_back(AlleleCode(tk[5], tl[5]));
+      const int chr = ChromosomeCode(tk[0], tl[0]);
+      AddVariant(chr, ParsePositionToken(tk[3], tl[3]), AlleleCode(tk[4], tl[4]), AlleleCode(tk[5], tl[5]));
       if(keepIds) bimIdHash.push_back(IdHash(tk[1], tl[1]));
-      counts[chr]++;
-      long long key = ((long long) chr << 32) | (long long) pos;
-      if(key < previousKey) bimSorted = false;
-      previousKey = key;
    }
    {
       std::string why;
       if(reader.Failed(why)) error("Cannot read %s completely (%s): the file may be truncated or damaged", opened.c_str(), why.c_str());
    }
    reader.Close();
-   bimCount = (int) bimPos.size();
-   // autosomes and XY; X is counted apart, and is scored unless --allowX 0
-   long long autosomes = counts[SEXCHR + 2];
-   for(int c = 1; c < SEXCHR; c++) autosomes += counts[c];
-   const long long scorable = autosomes + (ScoredChromosome(SEXCHR)? counts[SEXCHR]: 0);
-   unrecognized = counts[0];
-   printf("  Genotype data consist of %lld autosome SNPs", autosomes);
-   if(counts[SEXCHR+2]) printf(" (including %lld XY SNPs)", counts[SEXCHR+2]);
-   if(counts[SEXCHR]) printf(", %lld X-chromosome SNPs%s", counts[SEXCHR], ScoredChromosome(SEXCHR)? "": " (not scored)");
-   if(counts[SEXCHR+1]) printf(", %lld Y-chromosome SNPs", counts[SEXCHR+1]);
-   if(counts[SEXCHR+3]) printf(", %lld mitochondrial SNPs", counts[SEXCHR+3]);
-   if(unrecognized) printf(", %lld SNPs on unrecognized chromosomes", unrecognized);
-   printf("\n");
-   if(scorable < bimCount)
-      printf("  %lld other SNPs cannot be scored.\n", (long long) bimCount - scorable);
-   // SNPs that are not in (chromosome, position) order (rare) are looked up through a sorted index
-   posIndex.clear();
-   if(!bimSorted){
-      printf("  The .bim file is not sorted by chromosome and position; building an index...\n");
-      for(int r = 0; r < bimCount; r++)
-         if(ScoredChromosome(bimChr[r]) && bimPos[r] > 0)
-            posIndex.push_back(std::make_pair(((long long) bimChr[r] << 32) | (long long) bimPos[r], r));
-      std::sort(posIndex.begin(), posIndex.end());
-   }
+   FinishVariantTable(".bim file");
    printf("  PLINK maps loaded: %d SNPs\n", bimCount);
 }
 

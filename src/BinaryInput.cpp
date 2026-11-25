@@ -45,8 +45,11 @@
 //   allele code (4 bits) = effect allele * 4 + other allele, with A = 0, T = 1,
 //   C = 2, G = 3.  The 12 codes with two different alleles give the ordered pair
 //   (effect allele, other allele); every SNP has both alleles, and they differ.
-//   The 4 codes with the same letter twice (0, 5, 10, 15) are not valid: a reader
-//   drops such an entry (an early version 2 file used them for "no other allele").
+//   The 4 codes with the same letter twice (0, 5, 10, 15) mean that only the effect allele is
+//   known (a text model line without an other allele, or with the effect allele as the other
+//   allele): --makebin stores such a SNP with the effect allele twice, as SECRETS does, and
+//   --viewbin shows NA as its other allele.  Such a SNP cannot be matched to genotype data,
+//   which needs both alleles, so it is read and counted but not scored.
 //   Positions need 28 bits (up to 268,435,455).  Within a chromosome the SNPs are
 //   in order of position (ties keep their order in the text model).
 //   The weight is exactly the effect_weight of the text model, the weight of the
@@ -58,21 +61,22 @@
 //   A text model with no SNP that can be written (for example, every line lacks the other
 //   allele) gets no .bin file: it is skipped with a note and listed in <prefix>_scores.skipped.
 //
-//   Version 2 (secretscores 1.0.0 and 1.0.1) is the same without the headerSize field:
-//   byte 0 version = 2, bytes 1..104 the 26 SNP counts, the data from byte 105, and the
-//   trait block, if any, AFTER the data (found only from the file size).  It is still read,
-//   but --makebin writes version 3.
+//   GWAS summary statistics of SECRETS are version 4 files whose trait block starts with the
+//   marker "SECRETS GWAS summary statistics" and whose last column is a Z-score, not a frequency.
+//   They are not PGS models: they are refused with a note.
 //
-//   Versions 0 and 1 of earlier secretscores/SECRETS stored the pair in a fixed
-//   order and negated the weight when the effect allele came second.  That loses
-//   which allele the weight belongs to, so those files cannot give PGS Catalog
-//   scores; they are refused, and have to be made again from the text models.
+//   Versions 0, 1 and 2 of earlier secretscores/SECRETS are no longer read.  Versions 0 and 1
+//   stored the pair in a fixed order and negated the weight when the effect allele came second,
+//   which loses the allele the weight belongs to; version 2 (secretscores 1.0.0 and 1.0.1) had
+//   no header size and kept the trait block after the data.  They are refused, and have to be
+//   made again from the text models with --makebin.
 //
 // ---- --makebin: text model -> binary model ----
 //   For every line of the PGS Catalog scoring file with a usable effect_allele,
-//   effect_weight, hm_chr and hm_pos (the same lines that are scored):
-//     1. drop it when it has no other allele (other_allele, else hm_inferOtherAllele),
-//        or when the other allele is the effect allele;
+//   effect_weight, hm_chr and hm_pos:
+//     1. a line without an other allele (other_allele, else hm_inferOtherAllele), or with the
+//        effect allele as the other allele, keeps the effect allele only: its other allele is
+//        stored as the effect allele (counted in "NoOtherAllele" / "SameAllele");
 //     2. skip it when the effect allele or the other allele is not one letter from
 //        A, C, G, T, or when the position is above 268,435,455 (all counted);
 //     3. code = effect allele * 4 + other allele, and keep (position << 4 | code,
@@ -113,10 +117,10 @@
 
 static const int BIN_VERSION = 4;                     // written by --makebin when the model has frequencies
 static const int BIN_VERSION_NOFREQ = 3;              // written by --makebin without frequencies
-static const int BIN_VERSION_LEGACY = 2;              // still read: no header size, trailer after the data
 static const long long FIXED_HEADER_SIZE = 1 + 4 + 26 * 4;     // version, headerSize, 26 SNP counts = 109
 static const char LETTERS[4] = { 'A', 'T', 'C', 'G' };
 static const long MAX_BIN_POSITION = 0xFFFFFFFL;      // 28 bits
+static const char GWAS_MARKER[] = "SECRETS GWAS summary statistics";     // the trait block of a SECRETS GWAS file
 
 bool IsBinaryModelName(const std::string & file)
 {
@@ -194,10 +198,14 @@ static FILE *OpenBinaryModel(const char *filename, unsigned int snpCounts[26], s
    if(fp == NULL) Fail("Cannot open %s to read", filename);
    FileCloser guard(fp);
    int version = fgetc(fp);
+   if(version == EOF) Fail("%s is empty", filename);
    if(version == 0 || version == 1)
       Fail("%s is a binary model of an earlier format (version %d), which does not keep the weight\n"
-         "  of the effect allele. Make it again from its text model with --makebin.", filename, version);
-   if(version != BIN_VERSION && version != BIN_VERSION_NOFREQ && version != BIN_VERSION_LEGACY)
+         "  of the effect allele and is no longer read. Make it again from its text model with --makebin.", filename, version);
+   if(version == 2)
+      Fail("%s is a binary model of the format version 2 (secretscores 1.0.0 and 1.0.1), which is no longer read.\n"
+         "  Make it again from its text model with --makebin.", filename);
+   if(version != BIN_VERSION && version != BIN_VERSION_NOFREQ)
       Fail("The SECRETS format in %s cannot be recognized. The first byte is %x", filename, version);
    trait.clear();
    traitEfo.clear();
@@ -206,30 +214,11 @@ static FILE *OpenBinaryModel(const char *filename, unsigned int snpCounts[26], s
    FSEEK64(fp, 0, SEEK_END);
    const long long size = FTELL64(fp);
 
-   if(version == BIN_VERSION_LEGACY){
-      // version 2: SNP counts at byte 1, the data at byte 105, the optional trailer after the data
-      const long long dataStart = 1 + 26 * 4;
-      FSEEK64(fp, 1, SEEK_SET);
-      if(fread(snpCounts, sizeof(unsigned int), 26, fp) < 26)
-         Fail("Not enough words for SNP counts at each chromosome in %s", filename);
-      long long expected = dataStart;
-      for(int c = 0; c < 26; c++) expected += 8LL * snpCounts[c];
-      if(size < expected)
-         Fail("The size of %s (%lld bytes) does not agree with its SNP counts (%lld bytes expected)",
-            filename, size, expected);
-      if(size > expected){
-         FSEEK64(fp, expected, SEEK_SET);
-         ReadTraitBlock(fp, size - expected, filename, trait, traitEfo);
-      }
-      FSEEK64(fp, dataStart, SEEK_SET);
-      return guard.Release();
-   }
-
-   // version 3: bytes 1..4 give the size of the header, which ends with the optional trait block
+   // bytes 1..4 give the size of the header, which ends with the optional trait block
    unsigned int headerSize = 0;
    FSEEK64(fp, 1, SEEK_SET);
-   if(fread(&headerSize, sizeof(unsigned int), 1, fp) < 1)
-      Fail("Not enough bytes for the header size in %s", filename);
+   if(size < FIXED_HEADER_SIZE || fread(&headerSize, sizeof(unsigned int), 1, fp) < 1)
+      Fail("Not enough bytes for the header in %s", filename);
    if((long long) headerSize < FIXED_HEADER_SIZE)
       Fail("The header size in %s (%u bytes) is smaller than the minimum of %lld bytes", filename,
          headerSize, FIXED_HEADER_SIZE);
@@ -245,6 +234,9 @@ static FILE *OpenBinaryModel(const char *filename, unsigned int snpCounts[26], s
          filename, size, expected);
    if(headerSize > FIXED_HEADER_SIZE)
       ReadTraitBlock(fp, (long long) headerSize - FIXED_HEADER_SIZE, filename, trait, traitEfo);
+   if(version == BIN_VERSION && trait == GWAS_MARKER)
+      Fail("%s holds GWAS summary statistics (made for SECRETS --gwas), not a PGS model.\n"
+         "  secretscores scores PGS models only.", filename);
    FSEEK64(fp, headerSize, SEEK_SET);
    return guard.Release();
 }
@@ -358,15 +350,16 @@ static void MakeOneBinaryModel(const std::string & textFile, const std::string &
    ParseTextModel(textFile, stats,
       [&](int chr, long pos, const std::string & ea, const std::string & oa, double wt, double af){
          if(!ScoredChromosome(chr)) nonAutosomal++;     // written, but not scored
-         const int e = LetterCode(ea), o = LetterCode(oa);       // both alleles exist and differ
-         if(e < 0 || o < 0 || e == o || !(fabs(wt) < 3.0e38)){unsupportedAlleles++; return;}
+         // oa is empty for a SNP with the effect allele only: it is stored with the effect allele twice
+         const int e = LetterCode(ea), o = oa.empty()? e: LetterCode(oa);
+         if(e < 0 || o < 0 || !(fabs(wt) < 3.0e38)){unsupportedAlleles++; return;}
          if(pos > MAX_BIN_POSITION){positionTooLarge++; return;}
          BinSNP s;
          s.item = ((unsigned int) pos << 4) | (unsigned int)(e << 2 | o);
          s.weight = (float) wt;
          s.freq = (af >= 0.0 && af <= 1.0)? (float) af: std::numeric_limits<float>::quiet_NaN();
          snps[chr - 1].push_back(s);
-      });
+      }, true);
    unsigned int counts[26];
    long long written = 0, withFreq = 0;
    const bool hasFreq = stats.hasFreq;       // the model has an allelefrequency_effect column: version 4
@@ -396,12 +389,10 @@ static void MakeOneBinaryModel(const std::string & textFile, const std::string &
    std::string notWritten;
    char part[160];
    if(stats.noCoord){snprintf(part, sizeof(part), "%s%d without hm_chr/hm_pos", notWritten.empty()? "": ", ", stats.noCoord); notWritten += part;}
-   if(stats.noOtherAllele){snprintf(part, sizeof(part), "%s%d without other allele", notWritten.empty()? "": ", ", stats.noOtherAllele); notWritten += part;}
-   if(stats.sameAllele){snprintf(part, sizeof(part), "%s%d with other allele = effect allele", notWritten.empty()? "": ", ", stats.sameAllele); notWritten += part;}
    if(unsupportedAlleles){snprintf(part, sizeof(part), "%s%d with alleles other than single A/C/G/T", notWritten.empty()? "": ", ", unsupportedAlleles); notWritten += part;}
    if(positionTooLarge){snprintf(part, sizeof(part), "%s%d with position above %ld", notWritten.empty()? "": ", ", positionTooLarge, MAX_BIN_POSITION); notWritten += part;}
    if(stats.malformed){snprintf(part, sizeof(part), "%s%d lines without effect_allele/effect_weight", notWritten.empty()? "": ", ", stats.malformed); notWritten += part;}
-   // no SNP to write (for example, every line lacks the other allele): no .bin file is made
+   // no SNP to write (for example, no line has a position): no .bin file is made
    if(written == 0)
       ThrowModelError("%s has no valid SNPs, so no binary model is written (%s)", textFile.c_str(),
          notWritten.empty()? "the model has no SNPs": notWritten.c_str());
@@ -448,6 +439,8 @@ static void MakeOneBinaryModel(const std::string & textFile, const std::string &
    if(!trait.empty()) Appendf(out, " (trait: %s%s%s)", trait.c_str(), efo.empty()? "": ", ", efo.c_str());
    else if(!efo.empty()) Appendf(out, " (trait_efo: %s)", efo.c_str());
    if(!notWritten.empty()) Appendf(out, " (not written: %s)", notWritten.c_str());
+   if(stats.noOtherAllele + stats.sameAllele > 0)
+      Appendf(out, " (%d with the effect allele only)", stats.noOtherAllele + stats.sameAllele);
    Appendf(out, "\n");
    #pragma omp critical(secretscores_output)
    {
@@ -463,7 +456,7 @@ void MakeBinaryModels(const std::vector<std::string> & files, const std::vector<
    std::vector<std::string> outFiles(n);
    for(size_t i = 0; i < n; i++){
       if(IsBinaryModelName(files[i])) continue;       // skipped below, nothing is written for it
-      std::string name = names[i].empty()? ModelNameFromFile(files[i]): names[i];
+      std::string name = SafeScoreName(names[i].empty()? ModelNameFromFile(files[i]): names[i]);
       outFiles[i] = name + ".bin";
       for(size_t j = 0; j < n; j++)
          if(files[j] == outFiles[i])
@@ -483,6 +476,7 @@ void MakeBinaryModels(const std::vector<std::string> & files, const std::vector<
       todo.push_back(i);
    }
    const int total = (int) todo.size();
+   if(total == 0){printf("No text models to convert.\n"); return;}
    std::vector<CoverageRow> allRows(todo.size());
    std::vector<std::string> failed(todo.size());
    // each model is converted by one thread; the dynamic schedule balances the very different sizes.
@@ -565,7 +559,6 @@ void ViewBinaryModel(const std::string & file)
    printf("hm_chr\thm_pos\teffect_allele\tother_allele\teffect_weight%s\n", hasFreq? "\tallelefrequency_effect": "");
    std::vector<unsigned int> pos;
    std::vector<float> wt, fq;
-   long long invalid = 0;
    for(int c = 0; c < 26; c++){
       const size_t count = snpCounts[c];
       if(count == 0) continue;
@@ -584,9 +577,11 @@ void ViewBinaryModel(const std::string & file)
       const char *chr = ChromosomeLabel(c + 1, label);
       for(size_t m = 0; m < count; m++){
          const unsigned int code = pos[m] & 0xF;
-         if((code >> 2) == (code & 3)){invalid++; continue;}     // not a valid code: dropped, as when scoring
+         // a SNP with the effect allele only (the same letter twice) has no other allele: NA
+         const char *other = ((code >> 2) == (code & 3))? "NA": NULL;
          // %.9g: all the digits of a float32 weight, so that --makebin gives the same file back
-         printf("%s\t%u\t%c\t%c\t%.9g", chr, pos[m] >> 4, LETTERS[code >> 2], LETTERS[code & 3], (double) wt[m]);
+         if(other) printf("%s\t%u\t%c\t%s\t%.9g", chr, pos[m] >> 4, LETTERS[code >> 2], other, (double) wt[m]);
+         else printf("%s\t%u\t%c\t%c\t%.9g", chr, pos[m] >> 4, LETTERS[code >> 2], LETTERS[code & 3], (double) wt[m]);
          if(hasFreq){
             if(fq[m] >= 0.0f && fq[m] <= 1.0f) printf("\t%.9g", (double) fq[m]);
             else printf("\tNA");
@@ -595,6 +590,4 @@ void ViewBinaryModel(const std::string & file)
       }
    }
    fclose(fp);
-   if(invalid > 0)
-      fprintf(stderr, "Note: %lld entries of %s with an invalid allele code were not written.\n", invalid, file.c_str());
 }
